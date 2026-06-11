@@ -2,15 +2,17 @@ import os
 import json
 import time
 import shutil
+import zipfile
+from io import BytesIO
 import secrets
 import uuid
 from datetime import datetime
 from functools import wraps
 from typing import Any, Iterable, Optional
 
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, send_file
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import text
+from sqlalchemy import text, inspect
 from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,11 +31,29 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev-only-change-this-secret-key')
 os.makedirs(os.path.join(BASE_DIR, 'instance'), exist_ok=True)
 DB_PATH = os.path.join(BASE_DIR, 'instance', 'portal_new.db')
 
-# For local use this keeps SQLite. For server use you can set DATABASE_URL to
-# PostgreSQL/MySQL later without changing code.
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///' + DB_PATH)
+# -----------------------------------------------------------------------------
+# Database configuration
+# -----------------------------------------------------------------------------
+# Local/testing default: SQLite file at instance/portal_new.db
+# Production recommended: PostgreSQL through DATABASE_URL.
+# Example DATABASE_URL:
+#   postgresql+psycopg2://originfly_user:strong_password@localhost:5432/originfly_db
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+if DATABASE_URL.startswith('postgres://'):
+    # Some hosts still provide the old URL scheme. SQLAlchemy expects postgresql://.
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+DATABASE_URI = DATABASE_URL or ('sqlite:///' + DB_PATH)
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URI
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JSON_SORT_KEYS'] = False
+
+# PostgreSQL: keep connections healthy under production servers.
+if not DATABASE_URI.startswith('sqlite'):
+    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+        'pool_pre_ping': True,
+        'pool_recycle': 300,
+    }
 
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
@@ -78,6 +98,20 @@ db = SQLAlchemy(app)
 GLOBAL_STATE = {'last_updated': time.time()}
 DAY_MS = 24 * 60 * 60 * 1000
 DEFAULT_COMPANY_SUBSCRIPTION_DAYS = int(os.environ.get('DEFAULT_COMPANY_SUBSCRIPTION_DAYS', '30'))
+
+# v27 plan/limit defaults. Root admin can override these per company.
+COMPANY_PLAN_PRESETS = {
+    'basic': {'label': 'Basic', 'storage_limit_mb': 10 * 1024, 'team_limit': 5, 'project_limit': 3},
+    'pro': {'label': 'Pro', 'storage_limit_mb': 100 * 1024, 'team_limit': 25, 'project_limit': 20},
+    'enterprise': {'label': 'Enterprise', 'storage_limit_mb': 1024 * 1024, 'team_limit': 200, 'project_limit': 100},
+    'custom': {'label': 'Custom', 'storage_limit_mb': 10 * 1024, 'team_limit': 5, 'project_limit': 3},
+}
+DEFAULT_COMPANY_PLAN = os.environ.get('DEFAULT_COMPANY_PLAN', 'basic').lower()
+if DEFAULT_COMPANY_PLAN not in COMPANY_PLAN_PRESETS:
+    DEFAULT_COMPANY_PLAN = 'basic'
+
+PROJECT_TYPE_OPTIONS = ['Asset', 'Animation', 'Ai movie']
+DEFAULT_ALLOWED_PROJECT_TYPES = PROJECT_TYPE_OPTIONS.copy()
 
 
 # -----------------------------------------------------------------------------
@@ -509,6 +543,198 @@ def safe_join_upload(*parts: str) -> str:
     return final_path
 
 
+
+def bytes_to_mb(value: int) -> float:
+    return round(float(value or 0) / (1024 * 1024), 2)
+
+
+def mb_to_gb_label(mb: Optional[int]) -> str:
+    if mb is None:
+        return 'Unlimited'
+    mb = int(mb or 0)
+    if mb <= 0:
+        return '0 GB'
+    if mb >= 1024:
+        gb = mb / 1024
+        return f"{gb:.0f} GB" if gb.is_integer() else f"{gb:.1f} GB"
+    return f"{mb} MB"
+
+
+def company_upload_path(company_id: str) -> str:
+    return safe_join_upload('companies', company_id)
+
+
+def folder_size_bytes(path: str) -> int:
+    total = 0
+    if not path or not os.path.exists(path):
+        return 0
+    for root, _dirs, files in os.walk(path):
+        for filename in files:
+            fp = os.path.join(root, filename)
+            try:
+                if os.path.isfile(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
+def company_storage_used_bytes(company_id: Optional[str]) -> int:
+    if not company_id:
+        return 0
+    try:
+        return folder_size_bytes(company_upload_path(company_id))
+    except Exception:
+        return 0
+
+
+def file_storage_size_bytes(file_storage) -> int:
+    if not file_storage:
+        return 0
+    try:
+        pos = file_storage.stream.tell()
+        file_storage.stream.seek(0, os.SEEK_END)
+        size = file_storage.stream.tell()
+        file_storage.stream.seek(pos)
+        return int(size or 0)
+    except Exception:
+        try:
+            return int(file_storage.content_length or 0)
+        except Exception:
+            return 0
+
+
+def normalized_plan(plan: Optional[str]) -> str:
+    plan = (plan or DEFAULT_COMPANY_PLAN or 'basic').strip().lower()
+    return plan if plan in COMPANY_PLAN_PRESETS else 'custom'
+
+
+def company_plan_defaults(plan: Optional[str]) -> dict:
+    return COMPANY_PLAN_PRESETS.get(normalized_plan(plan), COMPANY_PLAN_PRESETS['custom']).copy()
+
+
+def company_limit_value(value: Any, default_value: int, minimum: int = 0, maximum: int = 999999) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = int(default_value)
+    return max(minimum, min(parsed, maximum))
+
+
+def normalize_project_type(value: Any) -> str:
+    raw = str(value or '').strip().lower().replace('_', ' ').replace('-', ' ')
+    aliases = {
+        'asset': 'Asset',
+        'assets': 'Asset',
+        'animation': 'Animation',
+        'anim': 'Animation',
+        'ai movie': 'Ai movie',
+        'aimovie': 'Ai movie',
+        'ai': 'Ai movie',
+        'movie': 'Ai movie',
+    }
+    return aliases.get(raw, 'Asset')
+
+
+def normalize_project_type_list(value: Any, default: Optional[list[str]] = None) -> list[str]:
+    if default is None:
+        default = DEFAULT_ALLOWED_PROJECT_TYPES
+    source = value
+    if isinstance(value, str):
+        loaded = safe_json_loads(value, None)
+        if loaded is None:
+            loaded = [v.strip() for v in value.split(',') if v.strip()]
+        source = loaded
+    if not isinstance(source, (list, tuple, set)):
+        source = default
+    allowed = []
+    for item in source:
+        normalized = normalize_project_type(item)
+        if normalized in PROJECT_TYPE_OPTIONS and normalized not in allowed:
+            allowed.append(normalized)
+    return allowed if allowed else []
+
+
+def company_allowed_project_types(company: Optional['Company']) -> list[str]:
+    if not company:
+        return DEFAULT_ALLOWED_PROJECT_TYPES.copy()
+    value = getattr(company, 'allowed_project_types', None)
+    if not value:
+        return DEFAULT_ALLOWED_PROJECT_TYPES.copy()
+    allowed = normalize_project_type_list(value, DEFAULT_ALLOWED_PROJECT_TYPES)
+    return allowed or DEFAULT_ALLOWED_PROJECT_TYPES.copy()
+
+
+def user_can_create_project_type(user: Optional['User'], project_type: Any) -> bool:
+    if not user:
+        return False
+    normalized = normalize_project_type(project_type)
+    if not user.company_id:
+        return normalized in PROJECT_TYPE_OPTIONS
+    company = company_for_user(user)
+    if not company:
+        return False
+    return normalized in company_allowed_project_types(company)
+
+
+def company_limits_payload(company: Optional['Company'], include_storage: bool = True) -> dict:
+    if not company:
+        return {}
+    plan = normalized_plan(getattr(company, 'plan', None))
+    defaults = company_plan_defaults(plan)
+    storage_limit_mb = int(getattr(company, 'storage_limit_mb', None) or defaults['storage_limit_mb'])
+    team_limit = int(getattr(company, 'team_limit', None) or defaults['team_limit'])
+    project_limit = int(getattr(company, 'project_limit', None) or defaults['project_limit'])
+    team_count = User.query.filter(User.company_id == company.id, User.role.notin_([COMPANY_ADMIN_ROLE, LEGACY_MANAGER_ROLE])).count()
+    project_count = Project.query.filter_by(company_id=company.id).count()
+    used_bytes = company_storage_used_bytes(company.id) if include_storage else 0
+    used_mb = bytes_to_mb(used_bytes)
+    storage_percent = int(round((used_mb / max(storage_limit_mb, 1)) * 100)) if storage_limit_mb > 0 else 0
+    storage_percent = max(0, min(storage_percent, 999))
+    return {
+        "plan": plan,
+        "planLabel": COMPANY_PLAN_PRESETS.get(plan, {}).get('label', plan.title()),
+        "storageLimitMB": storage_limit_mb,
+        "storageLimitLabel": mb_to_gb_label(storage_limit_mb),
+        "storageUsedBytes": used_bytes,
+        "storageUsedMB": used_mb,
+        "storageUsedGB": round(used_mb / 1024, 2),
+        "storagePercent": storage_percent,
+        "storageRemainingMB": max(0, round(storage_limit_mb - used_mb, 2)),
+        "teamLimit": team_limit,
+        "teamCount": team_count,
+        "teamPercent": max(0, min(100, int(round((team_count / max(team_limit, 1)) * 100)))) if team_limit > 0 else 0,
+        "projectLimit": project_limit,
+        "projectCount": project_count,
+        "projectPercent": max(0, min(100, int(round((project_count / max(project_limit, 1)) * 100)))) if project_limit > 0 else 0,
+    }
+
+
+def apply_company_limits_from_data(company: 'Company', data: dict, allow_defaults: bool = False) -> None:
+    plan = normalized_plan(data.get('plan') or getattr(company, 'plan', None) or DEFAULT_COMPANY_PLAN)
+    defaults = company_plan_defaults(plan)
+    company.plan = plan
+    if allow_defaults:
+        company.storage_limit_mb = company_limit_value(data.get('storageLimitMB') or data.get('storage_limit_mb') or defaults['storage_limit_mb'], defaults['storage_limit_mb'], 1, 10 * 1024 * 1024)
+        company.team_limit = company_limit_value(data.get('teamLimit') or data.get('team_limit') or defaults['team_limit'], defaults['team_limit'], 1, 100000)
+        company.project_limit = company_limit_value(data.get('projectLimit') or data.get('project_limit') or defaults['project_limit'], defaults['project_limit'], 1, 100000)
+    else:
+        if 'storageLimitMB' in data or 'storage_limit_mb' in data:
+            company.storage_limit_mb = company_limit_value(data.get('storageLimitMB') if 'storageLimitMB' in data else data.get('storage_limit_mb'), getattr(company, 'storage_limit_mb', None) or defaults['storage_limit_mb'], 1, 10 * 1024 * 1024)
+        if 'teamLimit' in data or 'team_limit' in data:
+            company.team_limit = company_limit_value(data.get('teamLimit') if 'teamLimit' in data else data.get('team_limit'), getattr(company, 'team_limit', None) or defaults['team_limit'], 1, 100000)
+        if 'projectLimit' in data or 'project_limit' in data:
+            company.project_limit = company_limit_value(data.get('projectLimit') if 'projectLimit' in data else data.get('project_limit'), getattr(company, 'project_limit', None) or defaults['project_limit'], 1, 100000)
+
+    if 'allowedProjectTypes' in data or 'allowed_project_types' in data:
+        requested_types = data.get('allowedProjectTypes') if 'allowedProjectTypes' in data else data.get('allowed_project_types')
+        allowed_types = normalize_project_type_list(requested_types, DEFAULT_ALLOWED_PROJECT_TYPES)
+        if not allowed_types:
+            allowed_types = ['Asset']
+        company.allowed_project_types = json.dumps(allowed_types)
+    elif allow_defaults and not getattr(company, 'allowed_project_types', None):
+        company.allowed_project_types = json.dumps(DEFAULT_ALLOWED_PROJECT_TYPES)
+
 def project_id_from_upload_url(file_url: str) -> Optional[str]:
     """Infer project access from upload URL.
 
@@ -551,6 +777,21 @@ def serialize_user(user: 'User', include_sensitive: bool = False) -> dict:
         "createdBy": public_user_id(User.query.get(user.created_by_id)) if user.created_by_id and User.query.get(user.created_by_id) else None,
     }
     data.update(company_subscription_payload(company))
+    if company:
+        limits = company_limits_payload(company, include_storage=True)
+        data.update({
+            "companyPlan": limits.get("plan"),
+            "companyPlanLabel": limits.get("planLabel"),
+            "companyStorageLimitMB": limits.get("storageLimitMB"),
+            "companyStorageLimitLabel": limits.get("storageLimitLabel"),
+            "companyStorageUsedMB": limits.get("storageUsedMB"),
+            "companyStoragePercent": limits.get("storagePercent"),
+            "companyTeamLimit": limits.get("teamLimit"),
+            "companyTeamCount": limits.get("teamCount"),
+            "companyProjectLimit": limits.get("projectLimit"),
+            "companyProjectCount": limits.get("projectCount"),
+            "companyAllowedProjectTypes": company_allowed_project_types(company),
+        })
     # Root Admin Support Login / impersonation info.
     # Only the currently active session user receives these fields.
     if session.get('support_root_user_id') and session.get('user_id') == user.id:
@@ -646,6 +887,11 @@ class Company(db.Model):
     expires_at = db.Column(db.Float, nullable=True)
     created_at = db.Column(db.Float, nullable=False, default=lambda: time.time() * 1000)
     active = db.Column(db.Boolean, default=True)
+    plan = db.Column(db.String(30), default=DEFAULT_COMPANY_PLAN)
+    storage_limit_mb = db.Column(db.Integer, default=lambda: COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['storage_limit_mb'])
+    team_limit = db.Column(db.Integer, default=lambda: COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['team_limit'])
+    project_limit = db.Column(db.Integer, default=lambda: COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['project_limit'])
+    allowed_project_types = db.Column(db.Text, nullable=True, default=lambda: json.dumps(DEFAULT_ALLOWED_PROJECT_TYPES))
 
 
 class User(db.Model):
@@ -722,21 +968,55 @@ class Invoice(db.Model):
     company_id = db.Column(db.String(50), nullable=True)
 
 
+class ActivityLog(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    created_at = db.Column(db.Float, nullable=False, default=lambda: time.time() * 1000)
+    actor_user_id = db.Column(db.Integer, nullable=True)
+    actor_name = db.Column(db.String(120), nullable=True)
+    actor_role = db.Column(db.String(50), nullable=True)
+    action = db.Column(db.String(120), nullable=False)
+    target_type = db.Column(db.String(80), nullable=True)
+    target_id = db.Column(db.String(120), nullable=True)
+    target_name = db.Column(db.String(200), nullable=True)
+    company_id = db.Column(db.String(50), nullable=True)
+    details = db.Column(db.Text, nullable=True)
+    ip_address = db.Column(db.String(80), nullable=True)
+
+
 # -----------------------------------------------------------------------------
-# Startup migrations for your existing SQLite file
+# Startup migrations
 # -----------------------------------------------------------------------------
+def quote_identifier(name: str) -> str:
+    """Quote table/column names safely for the current database engine."""
+    return db.engine.dialect.identifier_preparer.quote(name)
+
+
 def add_column_if_missing(table_name: str, column_name: str, ddl: str) -> None:
+    """Small compatibility migration helper.
+
+    This version works with both SQLite and PostgreSQL. It uses SQLAlchemy's
+    inspector instead of SELECTing from raw table names, because names like
+    `user` can behave differently across databases.
+    """
     try:
-        db.session.execute(text(f'SELECT {column_name} FROM {table_name} LIMIT 1'))
+        inspector = inspect(db.engine)
+        table_names = set(inspector.get_table_names())
+        if table_name not in table_names:
+            return
+        columns = {col['name'] for col in inspector.get_columns(table_name)}
+        if column_name in columns:
+            return
+        table_q = quote_identifier(table_name)
+        db.session.execute(text(f'ALTER TABLE {table_q} ADD COLUMN {ddl}'))
+        db.session.commit()
     except Exception:
         db.session.rollback()
-        db.session.execute(text(f'ALTER TABLE {table_name} ADD COLUMN {ddl}'))
-        db.session.commit()
+        raise
 
 
 with app.app_context():
     db.create_all()
-    add_column_if_missing('user', 'show_payments', 'show_payments BOOLEAN DEFAULT 1')
+    add_column_if_missing('user', 'show_payments', 'show_payments BOOLEAN DEFAULT TRUE')
     add_column_if_missing('project', 'type', "type VARCHAR(50) DEFAULT 'Asset'")
     add_column_if_missing('project', 'stages', 'stages TEXT')
     add_column_if_missing('project', 'pipeline_graph', 'pipeline_graph TEXT')
@@ -759,6 +1039,11 @@ with app.app_context():
     add_column_if_missing('company', 'visible_password', 'visible_password TEXT')
     add_column_if_missing('company', 'subscription_days', f'subscription_days INTEGER DEFAULT {DEFAULT_COMPANY_SUBSCRIPTION_DAYS}')
     add_column_if_missing('company', 'expires_at', 'expires_at FLOAT')
+    add_column_if_missing('company', 'plan', f"plan VARCHAR(30) DEFAULT '{DEFAULT_COMPANY_PLAN}'")
+    add_column_if_missing('company', 'storage_limit_mb', f"storage_limit_mb INTEGER DEFAULT {COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['storage_limit_mb']}")
+    add_column_if_missing('company', 'team_limit', f"team_limit INTEGER DEFAULT {COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['team_limit']}")
+    add_column_if_missing('company', 'project_limit', f"project_limit INTEGER DEFAULT {COMPANY_PLAN_PRESETS[DEFAULT_COMPANY_PLAN]['project_limit']}")
+    add_column_if_missing('company', 'allowed_project_types', "allowed_project_types TEXT")
 
     # Backfill subscription expiry for old company rows. Existing companies get
     # the default number of days from the first v12 launch unless they already
@@ -772,6 +1057,28 @@ with app.app_context():
         if not getattr(existing_company, 'expires_at', None):
             existing_company.expires_at = now_ms + (int(existing_company.subscription_days or DEFAULT_COMPANY_SUBSCRIPTION_DAYS) * DAY_MS)
             changed_companies = True
+        plan = normalized_plan(getattr(existing_company, 'plan', None))
+        defaults = company_plan_defaults(plan)
+        if getattr(existing_company, 'plan', None) != plan:
+            existing_company.plan = plan
+            changed_companies = True
+        if not getattr(existing_company, 'storage_limit_mb', None):
+            existing_company.storage_limit_mb = defaults['storage_limit_mb']
+            changed_companies = True
+        if not getattr(existing_company, 'team_limit', None):
+            existing_company.team_limit = defaults['team_limit']
+            changed_companies = True
+        if not getattr(existing_company, 'project_limit', None):
+            existing_company.project_limit = defaults['project_limit']
+            changed_companies = True
+        if not getattr(existing_company, 'allowed_project_types', None):
+            existing_company.allowed_project_types = json.dumps(DEFAULT_ALLOWED_PROJECT_TYPES)
+            changed_companies = True
+        else:
+            normalized_allowed_types = normalize_project_type_list(existing_company.allowed_project_types, DEFAULT_ALLOWED_PROJECT_TYPES)
+            if existing_company.allowed_project_types != json.dumps(normalized_allowed_types):
+                existing_company.allowed_project_types = json.dumps(normalized_allowed_types or DEFAULT_ALLOWED_PROJECT_TYPES)
+                changed_companies = True
     if changed_companies:
         db.session.commit()
 
@@ -805,6 +1112,104 @@ with app.app_context():
         db.session.commit()
 
 
+def serialize_activity_log(log: 'ActivityLog') -> dict:
+    details = safe_json_loads(log.details, {})
+    company_name = None
+    if log.company_id:
+        company = Company.query.get(log.company_id)
+        company_name = company.name if company else log.company_id
+    return {
+        "id": log.id,
+        "createdAt": log.created_at,
+        "actorUserId": public_user_id(User.query.get(log.actor_user_id)) if log.actor_user_id and User.query.get(log.actor_user_id) else None,
+        "actorName": log.actor_name or "System",
+        "actorRole": log.actor_role or "system",
+        "action": log.action,
+        "targetType": log.target_type,
+        "targetId": log.target_id,
+        "targetName": log.target_name,
+        "companyId": log.company_id,
+        "companyName": company_name,
+        "details": details,
+        "ipAddress": log.ip_address,
+    }
+
+
+def log_activity(action: str, target_type: str = None, target_id: str = None,
+                 target_name: str = None, details: Optional[dict] = None,
+                 company_id: Optional[str] = None, actor: Optional['User'] = None) -> None:
+    """Best-effort audit log. It never blocks the main user action."""
+    try:
+        actor = actor or get_current_user()
+        log = ActivityLog(
+            created_at=time.time() * 1000,
+            actor_user_id=actor.id if actor else None,
+            actor_name=actor.name if actor else 'System',
+            actor_role=actor.role if actor else 'system',
+            action=action,
+            target_type=target_type,
+            target_id=str(target_id) if target_id is not None else None,
+            target_name=str(target_name) if target_name is not None else None,
+            company_id=company_id if company_id is not None else (actor.company_id if actor else None),
+            details=json.dumps(details or {}, ensure_ascii=False),
+            ip_address=(request.headers.get('X-Forwarded-For', request.remote_addr) if request else None),
+        )
+        db.session.add(log)
+        db.session.commit()
+        mark_db_updated()
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+def is_root_admin_request() -> Optional['User']:
+    user = get_current_user()
+    return user if is_root_admin(user) else None
+
+
+def model_to_dict(row) -> dict:
+    result = {}
+    for col in row.__table__.columns:
+        result[col.name] = getattr(row, col.name)
+    return result
+
+
+def build_database_backup_payload() -> dict:
+    db_uri = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    db_type = 'sqlite' if db_uri.startswith('sqlite') else ('postgresql' if db_uri.startswith('postgresql') else 'unknown')
+    return {
+        "generatedAt": int(time.time() * 1000),
+        "databaseType": db_type,
+        "version": "fixed_v30_notifications",
+        "tables": {
+            "companies": [model_to_dict(x) for x in Company.query.all()],
+            "users": [model_to_dict(x) for x in User.query.all()],
+            "projects": [model_to_dict(x) for x in Project.query.all()],
+            "assignments": [model_to_dict(x) for x in Assignment.query.all()],
+            "invoices": [model_to_dict(x) for x in Invoice.query.all()],
+            "activity_logs": [model_to_dict(x) for x in ActivityLog.query.order_by(ActivityLog.created_at.asc()).all()],
+        }
+    }
+
+
+def zip_uploads_to_memory(include_database_json: bool = False) -> BytesIO:
+    memory_file = BytesIO()
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        if include_database_json:
+            backup_json = json.dumps(build_database_backup_payload(), ensure_ascii=False, indent=2).encode('utf-8')
+            zf.writestr('database_backup.json', backup_json)
+        if os.path.exists(UPLOAD_FOLDER):
+            for root, _dirs, files in os.walk(UPLOAD_FOLDER):
+                for filename in files:
+                    full_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(full_path, BASE_DIR)
+                    zf.write(full_path, rel_path)
+    memory_file.seek(0)
+    return memory_file
+
+
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -815,7 +1220,14 @@ def home():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return jsonify({"success": True, "status": "ok", "version": "fixed_v22_company_controls"})
+    db_uri = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+    if db_uri.startswith('sqlite'):
+        db_type = 'sqlite'
+    elif db_uri.startswith('postgresql'):
+        db_type = 'postgresql'
+    else:
+        db_type = db_uri.split(':', 1)[0] if ':' in db_uri else 'unknown'
+    return jsonify({"success": True, "status": "ok", "version": "fixed_v30_notifications", "database": db_type})
 
 
 @app.route('/api/login', methods=['POST'])
@@ -867,6 +1279,7 @@ def login():
         session['session_uid'] = account_session_uid
         user.last_active = time.time()
         db.session.commit()
+        log_activity('login_success', 'user', public_user_id(user), user.name, {"loginType": login_type}, user.company_id, actor=user)
         current_user_data = serialize_user(user, include_sensitive=True)
         current_user_data["allowedProjects"] = allowed_project_ids(user)
         return jsonify({"success": True, "user": current_user_data})
@@ -876,6 +1289,9 @@ def login():
 
 @app.route('/api/logout', methods=['POST'])
 def logout():
+    user = get_current_user()
+    if user:
+        log_activity('logout', 'user', public_user_id(user), user.name, actor=user)
     session.clear()
     return jsonify({"success": True})
 
@@ -948,6 +1364,7 @@ def update_admin_credentials():
 
     db.session.commit()
     mark_db_updated()
+    log_activity('admin_credentials_updated', 'user', public_user_id(admin_user), admin_user.name, {"usernameChanged": bool(new_username), "passwordChanged": bool(new_password)})
     return jsonify({"success": True})
 
 
@@ -992,6 +1409,14 @@ def add_user():
     if not name:
         return jsonify({"success": False, "message": "Name is required"}), 400
 
+    if current_user.company_id:
+        company = company_for_user(current_user)
+        if not company:
+            return jsonify({"success": False, "message": "Company not found"}), 404
+        limits = company_limits_payload(company, include_storage=False)
+        if limits.get('teamLimit') and limits.get('teamCount', 0) >= limits.get('teamLimit'):
+            return jsonify({"success": False, "message": f"Team limit reached ({limits.get('teamCount')}/{limits.get('teamLimit')}). Contact root admin to upgrade plan."}), 403
+
     # Login code is mandatory for client/freelancer/supervisor/manager login.
     # If the frontend accidentally sends a duplicate/blank value, generate a fresh one
     # instead of breaking with a database save error.
@@ -1032,6 +1457,7 @@ def add_user():
         return jsonify({"success": False, "message": "Database save failed"}), 500
 
     mark_db_updated()
+    log_activity('user_created', 'user', public_user_id(new_user), new_user.name, {"role": new_user.role, "allowedProjects": initial_projects}, new_user.company_id)
     return jsonify({"success": True, "user_id": public_user_id(new_user), "logincode": new_user.logincode})
 
 @app.route('/api/users/<user_id>', methods=['PUT'])
@@ -1068,6 +1494,7 @@ def update_user(user_id):
 
     db.session.commit()
     mark_db_updated()
+    log_activity('user_updated', 'user', public_user_id(target_user), target_user.name, {"fields": list(data.keys())}, target_user.company_id)
     return jsonify({"success": True})
 
 
@@ -1122,10 +1549,14 @@ def delete_user(user_id):
             Invoice.query.filter(Invoice.targetUserId.in_([f"u{x}" for x in managed_user_ids])).delete(synchronize_session=False)
         Invoice.query.filter_by(created_by_id=user.id).delete()
 
+    deleted_user_name = user.name
+    deleted_user_role = user.role
+    deleted_company_id = user.company_id
     remove_profile_pic(user)
     db.session.delete(user)
     db.session.commit()
     mark_db_updated()
+    log_activity('user_deleted', 'user', user_id, deleted_user_name, {"role": deleted_user_role}, deleted_company_id)
     return jsonify({"success": True})
 
 
@@ -1150,6 +1581,16 @@ def add_project():
     name = (data.get('name') or '').strip()
     if not new_project_id or not name:
         return jsonify({"success": False, "message": "Project id and name are required"}), 400
+    requested_project_type = normalize_project_type(data.get('type', 'Asset'))
+    if not user_can_create_project_type(current_user, requested_project_type):
+        return jsonify({"success": False, "message": f"{requested_project_type} project creation is disabled for this company. Contact root admin."}), 403
+    if current_user.company_id:
+        company = company_for_user(current_user)
+        if not company:
+            return jsonify({"success": False, "message": "Company not found"}), 404
+        limits = company_limits_payload(company, include_storage=False)
+        if limits.get('projectLimit') and limits.get('projectCount', 0) >= limits.get('projectLimit'):
+            return jsonify({"success": False, "message": f"Project limit reached ({limits.get('projectCount')}/{limits.get('projectLimit')}). Contact root admin to upgrade plan."}), 403
     if Project.query.get(new_project_id):
         return jsonify({"success": False, "message": "Project already exists"}), 409
 
@@ -1158,7 +1599,7 @@ def add_project():
         name=name,
         img=data.get('img'),
         active=data.get('active', False),
-        type=data.get('type', 'Asset'),
+        type=requested_project_type,
         stages=json.dumps(data.get('stages', ["Mod", "BS", "UV", "Tex", "Rig"])),
         pipeline_graph=data.get('pipeline_graph', None),
         episodes=json.dumps(data.get('episodes', [])),
@@ -1176,6 +1617,7 @@ def add_project():
 
     db.session.commit()
     mark_db_updated()
+    log_activity('project_created', 'project', new_project_id, name, {"type": requested_project_type}, current_user.company_id)
     return jsonify({"success": True})
 
 
@@ -1197,7 +1639,10 @@ def update_project(project_id):
         if 'active' in data:
             project.active = bool(data['active'])
         if 'type' in data:
-            project.type = data['type']
+            new_type = normalize_project_type(data['type'])
+            if not user_can_create_project_type(current_user, new_type):
+                return jsonify({"success": False, "message": f"{new_type} project type is disabled for this company. Contact root admin."}), 403
+            project.type = new_type
         if 'stages' in data:
             project.stages = json.dumps(data['stages'])
         if 'pipeline_graph' in data:
@@ -1212,6 +1657,7 @@ def update_project(project_id):
 
     db.session.commit()
     mark_db_updated()
+    log_activity('project_updated', 'project', project_id, project.name, {"fields": list(data.keys())}, project.company_id)
     return jsonify({"success": True})
 
 
@@ -1230,11 +1676,14 @@ def delete_project(project_id):
     if os.path.exists(folder_path):
         shutil.rmtree(folder_path, ignore_errors=True)
 
+    deleted_project_name = project.name
+    deleted_company_id = project.company_id
     Assignment.query.filter_by(project_id=project_id).delete()
     Invoice.query.filter_by(projectId=project_id).delete()
     db.session.delete(project)
     db.session.commit()
     mark_db_updated()
+    log_activity('project_deleted', 'project', project_id, deleted_project_name, company_id=deleted_company_id)
     return jsonify({"success": True})
 
 
@@ -1284,6 +1733,7 @@ def add_assignment():
     db.session.add(new_assignment)
     db.session.commit()
     mark_db_updated()
+    log_activity('assignment_created', 'assignment', new_assignment.id, new_assignment.name, {"projectId": project_id, "status": new_assignment.status, "currentStage": assignment_stage_name(safe_json_loads(new_assignment.levels, []), new_assignment.current_level_index)}, new_assignment.company_id)
     return jsonify({"success": True})
 
 
@@ -1297,6 +1747,13 @@ def update_assignment(assign_id):
         return jsonify({"success": False}), 404
     if not user_has_assignment_access(current_user, assignment):
         return jsonify({"success": False, "message": "Forbidden"}), 403
+
+    before_state = {
+        "status": assignment.status,
+        "currentLevelIndex": assignment.current_level_index or 0,
+        "versions": safe_json_loads(assignment.versions, []),
+        "completedLevels": safe_json_loads(assignment.completed_levels, []),
+    }
 
     fields = ['status', 'currentLevelIndex', 'assignedTo', 'createdAt', 'accumulatedTime', 'orderIndex']
     for field in fields:
@@ -1324,6 +1781,8 @@ def update_assignment(assign_id):
 
     db.session.commit()
     mark_db_updated()
+    notification_details = build_assignment_notification_details(assignment, data, before_state)
+    log_activity('assignment_updated', 'assignment', assign_id, assignment.name, notification_details, assignment.company_id)
     return jsonify({"success": True})
 
 
@@ -1345,10 +1804,13 @@ def delete_assignment(assign_id):
         if os.path.exists(folder_path):
             shutil.rmtree(folder_path, ignore_errors=True)
 
+    deleted_assignment_name = assignment.name
+    deleted_company_id = assignment.company_id
     Invoice.query.filter_by(assignmentId=assign_id).delete()
     db.session.delete(assignment)
     db.session.commit()
     mark_db_updated()
+    log_activity('assignment_deleted', 'assignment', assign_id, deleted_assignment_name, company_id=deleted_company_id)
     return jsonify({"success": True})
 
 
@@ -1395,6 +1857,7 @@ def add_invoice():
     db.session.add(new_inv)
     db.session.commit()
     mark_db_updated()
+    log_activity('record_created', 'invoice', new_inv.id, new_inv.description or new_inv.stage or new_inv.id, {"projectId": project_id, "amount": new_inv.amount, "status": new_inv.status}, new_inv.company_id)
     return jsonify({"success": True})
 
 
@@ -1421,6 +1884,7 @@ def update_invoice(inv_id):
 
     db.session.commit()
     mark_db_updated()
+    log_activity('record_updated', 'invoice', inv_id, inv.description or inv.stage or inv_id, {"fields": list(data.keys())}, inv.company_id)
     return jsonify({"success": True})
 
 
@@ -1433,9 +1897,12 @@ def delete_invoice(inv_id):
         return jsonify({"success": False}), 404
     if not can_access_invoice(get_current_user(), inv):
         return jsonify({"success": False, "message": "Forbidden"}), 403
+    deleted_inv_name = inv.description or inv.stage or inv_id
+    deleted_company_id = inv.company_id
     db.session.delete(inv)
     db.session.commit()
     mark_db_updated()
+    log_activity('record_deleted', 'invoice', inv_id, deleted_inv_name, company_id=deleted_company_id)
     return jsonify({"success": True})
 
 
@@ -1463,6 +1930,7 @@ def delete_single_file():
         try:
             os.remove(file_path)
             mark_db_updated()
+            log_activity('file_deleted', 'file', file_url, os.path.basename(file_path), {"fileUrl": file_url}, current_user.company_id)
         except Exception:
             return jsonify({"success": False, "message": "Could not delete file"}), 500
 
@@ -1517,6 +1985,21 @@ def upload_file():
         url_folder = f"static/uploads/{project_name}/{assignment_name}/{folder_type}"
     os.makedirs(dynamic_folder, exist_ok=True)
 
+    if current_user.company_id and project_name != 'System':
+        company = company_for_user(current_user)
+        if company:
+            limits = company_limits_payload(company, include_storage=True)
+            incoming_bytes = file_storage_size_bytes(file)
+            if 'thumbnail' in request.files:
+                incoming_bytes += file_storage_size_bytes(request.files.get('thumbnail'))
+            limit_bytes = int(limits.get('storageLimitMB') or 0) * 1024 * 1024
+            used_bytes = int(limits.get('storageUsedBytes') or 0)
+            if limit_bytes > 0 and used_bytes + incoming_bytes > limit_bytes:
+                return jsonify({
+                    "success": False,
+                    "message": f"Storage limit reached ({limits.get('storageUsedGB', 0)} GB / {limits.get('storageLimitLabel')}). Contact root admin to upgrade storage."
+                }), 403
+
     filepath = os.path.join(dynamic_folder, filename_to_save)
     file.save(filepath)
 
@@ -1538,6 +2021,7 @@ def upload_file():
         thumbnail_url = file_url
 
     mark_db_updated()
+    log_activity('file_uploaded', 'file', file_url, filename_to_save, {"folderType": folder_type, "projectName": project_name_raw, "assignmentName": assignment_name_raw}, current_user.company_id)
     return jsonify({"success": True, "fileUrl": file_url, "filename": filename_to_save, "thumbnailUrl": thumbnail_url})
 
 
@@ -1546,6 +2030,7 @@ def upload_file():
 def serialize_company(company: 'Company') -> dict:
     admin_user = User.query.filter_by(company_id=company.id, role=COMPANY_ADMIN_ROLE).first()
     subscription = company_subscription_payload(company)
+    limits = company_limits_payload(company, include_storage=True)
     remaining_days = subscription.get("companyRemainingDays")
     return {
         "id": company.id,
@@ -1562,8 +2047,22 @@ def serialize_company(company: 'Company') -> dict:
         "subscriptionPercent": subscription.get("companySubscriptionPercent", 0),
         "subscriptionWarning": subscription.get("companySubscriptionWarning", "none"),
         "createdAt": company.created_at,
-        "teamCount": User.query.filter(User.company_id == company.id, User.role.notin_([COMPANY_ADMIN_ROLE, LEGACY_MANAGER_ROLE])).count(),
-        "projectCount": Project.query.filter_by(company_id=company.id).count(),
+        "plan": limits.get("plan"),
+        "planLabel": limits.get("planLabel"),
+        "storageLimitMB": limits.get("storageLimitMB"),
+        "storageLimitLabel": limits.get("storageLimitLabel"),
+        "storageUsedBytes": limits.get("storageUsedBytes"),
+        "storageUsedMB": limits.get("storageUsedMB"),
+        "storageUsedGB": limits.get("storageUsedGB"),
+        "storagePercent": limits.get("storagePercent"),
+        "storageRemainingMB": limits.get("storageRemainingMB"),
+        "teamLimit": limits.get("teamLimit"),
+        "teamCount": limits.get("teamCount"),
+        "teamPercent": limits.get("teamPercent"),
+        "projectLimit": limits.get("projectLimit"),
+        "projectCount": limits.get("projectCount"),
+        "projectPercent": limits.get("projectPercent"),
+        "allowedProjectTypes": company_allowed_project_types(company),
     }
 
 
@@ -1618,6 +2117,7 @@ def add_company():
         created_at=now_ms,
         active=True
     )
+    apply_company_limits_from_data(company, data, allow_defaults=True)
     company_admin = User(
         session_uid=generate_session_uid(),
         name=name,
@@ -1642,6 +2142,34 @@ def add_company():
         return jsonify({"success": False, "message": "Database save failed"}), 500
 
     mark_db_updated()
+    log_activity('company_created', 'company', company.id, company.name, {"username": username, "subscriptionDays": subscription_days, "plan": company.plan, "storageLimitMB": company.storage_limit_mb, "teamLimit": company.team_limit, "projectLimit": company.project_limit, "allowedProjectTypes": company_allowed_project_types(company)}, company.id)
+    return jsonify({"success": True, "company": serialize_company(company)})
+
+
+
+@app.route('/api/companies/<company_id>/limits', methods=['PUT'])
+@login_required
+@require_roles('admin')
+def update_company_limits(company_id):
+    current_user = get_current_user()
+    if not is_root_admin(current_user):
+        return jsonify({"success": False, "message": "Only root admin can update company plan and limits"}), 403
+
+    company = Company.query.get(company_id)
+    if not company:
+        return jsonify({"success": False, "message": "Company not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    apply_company_limits_from_data(company, data, allow_defaults=True)
+    db.session.commit()
+    mark_db_updated()
+    log_activity('company_limits_updated', 'company', company.id, company.name, {
+        "plan": company.plan,
+        "storageLimitMB": company.storage_limit_mb,
+        "teamLimit": company.team_limit,
+        "projectLimit": company.project_limit,
+        "allowedProjectTypes": company_allowed_project_types(company),
+    }, company.id)
     return jsonify({"success": True, "company": serialize_company(company)})
 
 
@@ -1687,6 +2215,7 @@ def update_company_credentials(company_id):
         return jsonify({"success": False, "message": "Database save failed"}), 500
 
     mark_db_updated()
+    log_activity('company_credentials_updated', 'company', company.id, company.name, {"usernameChanged": bool(username), "passwordChanged": bool(password)}, company.id)
     return jsonify({"success": True, "company": serialize_company(company)})
 
 
@@ -1720,6 +2249,7 @@ def update_company_subscription(company_id):
     company.active = days > 0
     db.session.commit()
     mark_db_updated()
+    log_activity('company_subscription_date_set', 'company', company.id, company.name, {"days": days, "expiresAt": company.expires_at}, company.id)
     return jsonify({"success": True, "company": serialize_company(company)})
 
 
@@ -1764,6 +2294,7 @@ def add_company_subscription_days(company_id):
         company.active = True
     db.session.commit()
     mark_db_updated()
+    log_activity('company_subscription_days_changed', 'company', company.id, company.name, {"daysChanged": add_days, "expiresAt": company.expires_at}, company.id)
     return jsonify({"success": True, "company": serialize_company(company)})
 
 
@@ -1791,6 +2322,7 @@ def set_company_block(company_id):
     company.active = not blocked
     db.session.commit()
     mark_db_updated()
+    log_activity('company_blocked' if blocked else 'company_unblocked', 'company', company.id, company.name, {"blocked": blocked}, company.id)
     return jsonify({"success": True, "company": serialize_company(company)})
 
 
@@ -1826,6 +2358,7 @@ def login_as_company(company_id):
     company_admin.last_active = time.time()
     db.session.commit()
     mark_db_updated()
+    log_activity('support_login_as_company', 'company', company.id, company.name, {"companyAdmin": company_admin.username}, company.id, actor=root_user)
 
     current_user_data = serialize_user(company_admin, include_sensitive=True)
     current_user_data["allowedProjects"] = allowed_project_ids(company_admin)
@@ -1859,6 +2392,7 @@ def exit_support_login():
     root_user.last_active = time.time()
     db.session.commit()
     mark_db_updated()
+    log_activity('support_mode_exited', 'user', public_user_id(root_user), root_user.name, actor=root_user)
 
     current_user_data = serialize_user(root_user, include_sensitive=True)
     current_user_data["allowedProjects"] = allowed_project_ids(root_user)
@@ -1882,6 +2416,7 @@ def delete_company(company_id):
     if os.path.exists(company_upload_folder):
         shutil.rmtree(company_upload_folder, ignore_errors=True)
 
+    deleted_company_name = company.name
     Invoice.query.filter_by(company_id=company_id).delete(synchronize_session=False)
     Assignment.query.filter_by(company_id=company_id).delete(synchronize_session=False)
     Project.query.filter_by(company_id=company_id).delete(synchronize_session=False)
@@ -1889,6 +2424,7 @@ def delete_company(company_id):
     db.session.delete(company)
     db.session.commit()
     mark_db_updated()
+    log_activity('company_deleted', 'company', company_id, deleted_company_name, company_id=company_id)
     return jsonify({"success": True})
 
 
@@ -1896,6 +2432,475 @@ def delete_company(company_id):
 def request_entity_too_large(error):
     max_mb = app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)
     return jsonify({"success": False, "message": f"File too large. Max upload size is {max_mb} MB."}), 413
+
+
+
+
+
+# --- v30 NOTIFICATION FEED HELPERS ---
+NOTIFICATION_ACTIONS = {
+    'user_created', 'user_updated', 'user_deleted',
+    'project_created', 'project_updated', 'project_deleted',
+    'assignment_created', 'assignment_updated', 'assignment_deleted',
+    'record_created', 'record_updated', 'record_deleted',
+    'file_uploaded', 'file_deleted',
+    'company_created', 'company_deleted', 'company_blocked', 'company_unblocked',
+    'company_subscription_date_set', 'company_subscription_days_changed',
+    'company_limits_updated', 'company_credentials_updated',
+    'support_login_as_company', 'support_mode_exited'
+}
+
+
+
+def assignment_stage_name(levels: Any, index: Any, fallback: str = 'Stage') -> str:
+    """Return a safe human stage name for notification messages."""
+    if isinstance(levels, str):
+        levels = safe_json_loads(levels, [])
+    if not isinstance(levels, list):
+        levels = []
+    try:
+        idx = int(index or 0)
+    except Exception:
+        idx = 0
+    if 0 <= idx < len(levels):
+        value = str(levels[idx]).strip()
+        return value or fallback
+    return fallback if levels else 'Final'
+
+
+def latest_version_payload(versions: Any) -> dict:
+    if isinstance(versions, str):
+        versions = safe_json_loads(versions, [])
+    if isinstance(versions, list) and versions:
+        latest = versions[0]
+        return latest if isinstance(latest, dict) else {}
+    return {}
+
+
+def build_assignment_notification_details(assignment: 'Assignment', data: dict, before: dict) -> dict:
+    """Create structured details so notifications can say exactly what changed."""
+    fields = list(data.keys())
+    levels = safe_json_loads(assignment.levels, [])
+    new_versions = safe_json_loads(assignment.versions, [])
+    old_versions = before.get('versions') if isinstance(before.get('versions'), list) else []
+    latest_version = latest_version_payload(new_versions)
+
+    old_status = before.get('status')
+    new_status = assignment.status
+    old_index = before.get('currentLevelIndex', 0)
+    new_index = assignment.current_level_index or 0
+    current_stage = assignment_stage_name(levels, new_index, 'Stage')
+    previous_stage = assignment_stage_name(levels, old_index, current_stage)
+    next_stage = assignment_stage_name(levels, new_index, 'Next Stage')
+
+    retake_requested = bool(new_status == 'retake' or latest_version.get('isRetake'))
+    new_version_added = len(new_versions) > len(old_versions)
+    published_for_review = bool(new_status in {'uploaded', 'published'} or (new_version_added and not latest_version.get('isRetake')))
+    stage_approved = bool(new_index != old_index and new_index > old_index)
+    all_stages_completed = bool(new_status == 'approved')
+    assignment_on_hold = bool(new_status == 'hold')
+
+    return {
+        "fields": fields,
+        "projectId": assignment.project_id,
+        "oldStatus": old_status,
+        "status": new_status,
+        "previousLevelIndex": old_index,
+        "currentLevelIndex": new_index,
+        "previousStage": previous_stage,
+        "currentStage": current_stage,
+        "approvedStage": previous_stage if stage_approved else None,
+        "nextStage": next_stage if stage_approved else current_stage,
+        "stageApprovedByAdmin": stage_approved,
+        "allStagesCompleted": all_stages_completed,
+        "publishedForReview": published_for_review,
+        "assignmentOnHold": assignment_on_hold,
+        "retakeRequested": retake_requested,
+        "newVersionAdded": new_version_added,
+        "latestVersionName": latest_version.get('vName'),
+        "retakeNote": latest_version.get('note') if retake_requested else None,
+    }
+
+def notification_type_from_action(action: str, details: Optional[dict] = None) -> str:
+    action = action or ''
+    details = details or {}
+    fields = details.get('fields') or []
+    if details.get('retakeRequested') or 'retake' in str(details).lower():
+        return 'retake'
+    if details.get('publishedForReview') or action in {'file_uploaded', 'file_deleted'} or ('versions' in fields):
+        return 'file'
+    if details.get('assignmentOnHold'):
+        return 'assignment'
+    if details.get('stageApprovedByAdmin') or details.get('allStagesCompleted'):
+        return 'approval'
+    if action.startswith('company_subscription'):
+        return 'subscription'
+    if action in {'company_blocked', 'company_unblocked', 'company_limits_updated', 'company_credentials_updated', 'company_created', 'company_deleted'}:
+        return 'company'
+    if action.startswith('record_'):
+        return 'record'
+    if action.startswith('project_'):
+        return 'project'
+    if action.startswith('user_'):
+        return 'team'
+    if action.startswith('assignment_'):
+        if 'status' in fields or 'currentLevelIndex' in fields or 'completedLevels' in fields:
+            return 'approval'
+        return 'assignment'
+    return 'system'
+
+def activity_notification_access(user: 'User', log: 'ActivityLog') -> bool:
+    if not user:
+        return False
+    # Notification bell must stay inside the current workspace.
+    # Root admin should not receive every company feed item here; company-wide
+    # auditing is still available from the Activity window.
+    if not same_workspace(user, log.company_id):
+        return False
+    if user.role in STAFF_ROLES:
+        return True
+
+    target_type = (log.target_type or '').lower()
+    target_id = log.target_id
+    if target_type == 'assignment' and target_id:
+        assignment = Assignment.query.get(target_id)
+        return bool(assignment and user_has_assignment_access(user, assignment))
+    if target_type == 'project' and target_id:
+        return user_has_project_access(user, target_id)
+    if target_type == 'invoice' and target_id:
+        invoice = Invoice.query.get(target_id)
+        return bool(invoice and can_access_invoice(user, invoice))
+    if target_type == 'file':
+        details = safe_json_loads(log.details, {})
+        project_id = project_id_from_upload_url(target_id or details.get('fileUrl') or '')
+        return bool(project_id and user_has_project_access(user, project_id))
+    return False
+
+
+def notification_actor_visible_to(user: Optional['User']) -> bool:
+    """Only admin/company admin and supervisors should see who performed work updates."""
+    return bool(user and (user.role in STAFF_ROLES or user.role == 'supervisor'))
+
+
+def notification_message_from_log(log: 'ActivityLog', viewer: Optional['User'] = None) -> str:
+    details = safe_json_loads(log.details, {})
+    action = log.action or 'update'
+    name = log.target_name or log.target_id or 'item'
+    actor = log.actor_name or 'Someone'
+    show_actor = notification_actor_visible_to(viewer)
+    stage = details.get('currentStage') or 'Stage'
+    approved_stage = details.get('approvedStage') or details.get('previousStage') or stage
+    next_stage = details.get('nextStage') or stage
+
+    # Assignment notifications are written first because clients need clear,
+    # role-safe production messages without freelancer/admin names.
+    if action == 'assignment_created':
+        base = f'New assignment added: {name}'
+        return f'{actor} added assignment {name}' if show_actor else base
+
+    if action == 'project_created':
+        base = f'New project created: {name}'
+        return f'{actor} created project {name}' if show_actor else base
+
+    if action == 'assignment_updated':
+        if details.get('retakeRequested'):
+            note = (details.get('retakeNote') or '').strip()
+            base = f'Retake requested for {name}'
+            if stage:
+                base = f'Retake requested for {name} - {stage}'
+            if note:
+                # Keep note short in the bell; full assignment still opens on click.
+                base = f'{base}: {note[:90]}'
+            return f'{actor} requested retake for {name} - {stage}' if show_actor else base
+        if details.get('publishedForReview'):
+            base = f'{stage} published - ready for review: {name}'
+            return f'{actor} published {stage} for review: {name}' if show_actor else base
+        if details.get('stageApprovedByAdmin'):
+            base = f'{approved_stage} approved by admin - ready for {next_stage}: {name}'
+            return f'{actor} approved {approved_stage} - ready for {next_stage}: {name}' if show_actor else base
+        if details.get('allStagesCompleted'):
+            base = f'All stages completed: {name}'
+            return f'{actor} completed all stages for {name}' if show_actor else base
+        if details.get('assignmentOnHold'):
+            base = f'Assignment in hold: {name}'
+            return f'{actor} put assignment on hold: {name}' if show_actor else base
+        fields = details.get('fields') or []
+        if 'status' in fields or 'currentLevelIndex' in fields or 'completedLevels' in fields:
+            base = f'Stage status updated: {name}'
+            return f'{actor} updated stage status for {name}' if show_actor else base
+        base = f'Assignment updated: {name}'
+        return f'{actor} updated assignment {name}' if show_actor else base
+
+    if show_actor:
+        labels = {
+            'user_created': f'{actor} added team member {name}',
+            'user_updated': f'{actor} updated team member {name}',
+            'user_deleted': f'{actor} deleted team member {name}',
+            'project_updated': f'{actor} updated project {name}',
+            'project_deleted': f'{actor} deleted project {name}',
+            'assignment_deleted': f'{actor} deleted assignment {name}',
+            'record_created': f'{actor} added record {name}',
+            'record_updated': f'{actor} updated record {name}',
+            'record_deleted': f'{actor} deleted record {name}',
+            'file_uploaded': f'{actor} uploaded file {name}',
+            'file_deleted': f'{actor} deleted file {name}',
+            'company_created': f'{actor} created company {name}',
+            'company_deleted': f'{actor} removed company {name}',
+            'company_blocked': f'{actor} blocked company {name}',
+            'company_unblocked': f'{actor} unblocked company {name}',
+            'company_subscription_date_set': f'{actor} changed subscription date for {name}',
+            'company_subscription_days_changed': f'{actor} changed subscription days for {name}',
+            'company_limits_updated': f'{actor} updated plan/limits for {name}',
+            'company_credentials_updated': f'{actor} updated login for {name}',
+            'support_login_as_company': f'{actor} opened support mode for {name}',
+            'support_mode_exited': f'{actor} exited support mode',
+        }
+        message = labels.get(action, f'{actor} made an update: {name}')
+        if action == 'company_subscription_days_changed' and details.get('daysChanged') is not None:
+            days = details.get('daysChanged')
+            message = f'{actor} changed subscription by {days:+} days for {name}' if isinstance(days, (int, float)) else message
+        return message
+
+    # Client/freelancer-safe messages: no staff/freelancer names, no actor metadata.
+    labels = {
+        'user_created': f'Team member added: {name}',
+        'user_updated': f'Team member updated: {name}',
+        'user_deleted': f'Team member removed: {name}',
+        'project_updated': f'Project updated: {name}',
+        'project_deleted': f'Project removed: {name}',
+        'assignment_deleted': f'Assignment removed: {name}',
+        'record_created': f'Record added: {name}',
+        'record_updated': f'Record updated: {name}',
+        'record_deleted': f'Record removed: {name}',
+        'file_uploaded': f'New file uploaded: {name}',
+        'file_deleted': f'File removed: {name}',
+        'company_created': f'Company created: {name}',
+        'company_deleted': f'Company removed: {name}',
+        'company_blocked': f'Company blocked: {name}',
+        'company_unblocked': f'Company unblocked: {name}',
+        'company_subscription_date_set': f'Subscription date updated for {name}',
+        'company_subscription_days_changed': f'Subscription days updated for {name}',
+        'company_limits_updated': f'Plan/limits updated for {name}',
+        'company_credentials_updated': f'Login updated for {name}',
+        'support_login_as_company': f'Support mode opened for {name}',
+        'support_mode_exited': 'Support mode exited',
+    }
+    message = labels.get(action, f'Update: {name}')
+    if action == 'company_subscription_days_changed' and details.get('daysChanged') is not None:
+        message = f'Subscription days updated for {name}'
+    return message
+
+def activity_log_to_notification(log: 'ActivityLog', viewer: Optional['User'] = None) -> dict:
+    details = safe_json_loads(log.details, {})
+    target_type = (log.target_type or '').lower()
+    project_id = None
+    assignment_id = None
+    if target_type == 'assignment' and log.target_id:
+        assignment_id = log.target_id
+        assignment = Assignment.query.get(log.target_id)
+        if assignment:
+            project_id = assignment.project_id
+    elif target_type == 'project' and log.target_id:
+        project_id = log.target_id
+    elif target_type == 'file':
+        project_id = project_id_from_upload_url(log.target_id or details.get('fileUrl') or '')
+
+    return {
+        "id": f"log_{log.id}",
+        "source": "server",
+        "type": notification_type_from_action(log.action, details),
+        "msg": notification_message_from_log(log, viewer),
+        "time": datetime.fromtimestamp((log.created_at or 0) / 1000).strftime('%d %b, %I:%M %p'),
+        "timestamp": log.created_at,
+        "projectId": project_id,
+        "assignmentId": assignment_id,
+        "actorName": log.actor_name if notification_actor_visible_to(viewer) else None,
+        "actorRole": log.actor_role if notification_actor_visible_to(viewer) else None,
+        "action": log.action,
+        "companyId": log.company_id,
+        "companyName": Company.query.get(log.company_id).name if log.company_id and Company.query.get(log.company_id) else None,
+        "stageName": details.get('currentStage'),
+        "approvedStage": details.get('approvedStage'),
+        "nextStage": details.get('nextStage'),
+        "retakeNote": details.get('retakeNote') if details.get('retakeRequested') else None,
+    }
+
+
+def company_alert_notifications_for_user(user: 'User') -> list:
+    notifications = []
+    companies = []
+    # Keep the root admin notification bell clean. Root admin can still review
+    # company subscription/storage issues from the Companies page/Activity tab.
+    if is_root_admin(user):
+        companies = []
+    elif user.company_id:
+        company = Company.query.get(user.company_id)
+        if company:
+            companies = [company]
+
+    now_ms = time.time() * 1000
+    for company in companies:
+        subscription = company_subscription_payload(company)
+        limits = company_limits_payload(company, include_storage=True)
+        company_label = company.name
+        expires_at = subscription.get('companyExpiresAt') or 0
+        remaining = subscription.get('companyRemainingDays')
+        warning = subscription.get('companySubscriptionWarning')
+        if warning in {'warning', 'critical', 'expired'}:
+            if warning == 'expired':
+                msg = f'{company_label} subscription expired'
+            elif warning == 'critical':
+                msg = f'{company_label} subscription ends in {remaining} day(s)'
+            else:
+                msg = f'{company_label} subscription ends in {remaining} day(s)'
+            notifications.append({
+                "id": f"subscription_{company.id}_{int(expires_at)}",
+                "source": "server",
+                "type": "subscription",
+                "msg": msg,
+                "time": "Subscription",
+                "timestamp": now_ms + 3,
+                "projectId": None,
+                "assignmentId": None,
+                "companyId": company.id,
+                "companyName": company_label,
+            })
+        if int(limits.get('storagePercent') or 0) >= 80:
+            notifications.append({
+                "id": f"storage_{company.id}_{int(limits.get('storageUsedMB') or 0)}_{int(limits.get('storageLimitMB') or 0)}",
+                "source": "server",
+                "type": "storage",
+                "msg": f"{company_label} storage is {limits.get('storagePercent')}% used ({limits.get('storageUsedGB')} GB / {limits.get('storageLimitLabel')})",
+                "time": "Storage",
+                "timestamp": now_ms + 2,
+                "projectId": None,
+                "assignmentId": None,
+                "companyId": company.id,
+                "companyName": company_label,
+            })
+        if int(limits.get('teamPercent') or 0) >= 90:
+            notifications.append({
+                "id": f"team_limit_{company.id}_{limits.get('teamCount')}_{limits.get('teamLimit')}",
+                "source": "server",
+                "type": "limit",
+                "msg": f"{company_label} team limit is almost full ({limits.get('teamCount')} / {limits.get('teamLimit')})",
+                "time": "Limit",
+                "timestamp": now_ms + 1,
+                "projectId": None,
+                "assignmentId": None,
+                "companyId": company.id,
+                "companyName": company_label,
+            })
+        if int(limits.get('projectPercent') or 0) >= 90:
+            notifications.append({
+                "id": f"project_limit_{company.id}_{limits.get('projectCount')}_{limits.get('projectLimit')}",
+                "source": "server",
+                "type": "limit",
+                "msg": f"{company_label} project limit is almost full ({limits.get('projectCount')} / {limits.get('projectLimit')})",
+                "time": "Limit",
+                "timestamp": now_ms,
+                "projectId": None,
+                "assignmentId": None,
+                "companyId": company.id,
+                "companyName": company_label,
+            })
+    return notifications
+
+
+@app.route('/api/notifications/feed', methods=['GET'])
+@login_required
+def get_notification_feed():
+    current_user = get_current_user()
+    try:
+        limit = int(request.args.get('limit', 80))
+    except Exception:
+        limit = 80
+    limit = max(10, min(limit, 200))
+
+    notifications = company_alert_notifications_for_user(current_user)
+    q = ActivityLog.query
+    # Bell feed isolation: load only the active account/workspace feed.
+    # Root admin uses the root workspace (company_id NULL); company accounts use
+    # their own company_id. This prevents one company's updates from appearing
+    # in another account's notification bell.
+    if current_user.company_id:
+        q = q.filter_by(company_id=current_user.company_id)
+    else:
+        q = q.filter(ActivityLog.company_id.is_(None))
+    logs = q.order_by(ActivityLog.created_at.desc()).limit(limit * 3).all()
+    for log in logs:
+        if log.action not in NOTIFICATION_ACTIONS:
+            continue
+        if not activity_notification_access(current_user, log):
+            continue
+        notifications.append(activity_log_to_notification(log, current_user))
+        if len(notifications) >= limit:
+            break
+    notifications.sort(key=lambda n: n.get('timestamp') or 0, reverse=True)
+    return jsonify({"success": True, "notifications": notifications[:limit]})
+
+@app.route('/api/activity', methods=['GET'])
+@login_required
+def get_activity_logs():
+    current_user = get_current_user()
+    if current_user.role not in STAFF_ROLES:
+        return jsonify({"success": False, "message": "Forbidden"}), 403
+
+    try:
+        limit = int(request.args.get('limit', 200))
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, 500))
+    q = ActivityLog.query
+    if not is_root_admin(current_user):
+        q = q.filter_by(company_id=current_user.company_id)
+    else:
+        company_id = (request.args.get('companyId') or '').strip()
+        if company_id:
+            q = q.filter_by(company_id=company_id)
+    logs = q.order_by(ActivityLog.created_at.desc()).limit(limit).all()
+    return jsonify({"success": True, "logs": [serialize_activity_log(x) for x in logs]})
+
+
+@app.route('/api/backups/database', methods=['GET'])
+@login_required
+@require_roles('admin')
+def download_database_backup():
+    current_user = get_current_user()
+    if not is_root_admin(current_user):
+        return jsonify({"success": False, "message": "Only root admin can download backups"}), 403
+    log_activity('backup_database_downloaded', 'backup', 'database', 'Database backup')
+    data = json.dumps(build_database_backup_payload(), ensure_ascii=False, indent=2).encode('utf-8')
+    mem = BytesIO(data)
+    mem.seek(0)
+    filename = 'originfly_database_backup_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.json'
+    return send_file(mem, as_attachment=True, download_name=filename, mimetype='application/json')
+
+
+@app.route('/api/backups/uploads', methods=['GET'])
+@login_required
+@require_roles('admin')
+def download_uploads_backup():
+    current_user = get_current_user()
+    if not is_root_admin(current_user):
+        return jsonify({"success": False, "message": "Only root admin can download backups"}), 403
+    log_activity('backup_uploads_downloaded', 'backup', 'uploads', 'Uploads backup')
+    mem = zip_uploads_to_memory(include_database_json=False)
+    filename = 'originfly_uploads_backup_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.zip'
+    return send_file(mem, as_attachment=True, download_name=filename, mimetype='application/zip')
+
+
+@app.route('/api/backups/full', methods=['GET'])
+@login_required
+@require_roles('admin')
+def download_full_backup():
+    current_user = get_current_user()
+    if not is_root_admin(current_user):
+        return jsonify({"success": False, "message": "Only root admin can download backups"}), 403
+    log_activity('backup_full_downloaded', 'backup', 'full', 'Full backup')
+    mem = zip_uploads_to_memory(include_database_json=True)
+    filename = 'originfly_full_backup_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.zip'
+    return send_file(mem, as_attachment=True, download_name=filename, mimetype='application/zip')
 
 
 if __name__ == '__main__':
